@@ -10,6 +10,7 @@
 const int DIR_PIN = 2;
 const int ENABLE_PIN = 3;
 const int STEP_PIN = 5;
+const int SERVO_PIN = 4;
 
 // Используем пины с аппаратными прерываниями для кнопки
 #define PIN_BUTTON_INTERRUPT 2
@@ -58,6 +59,22 @@ const unsigned long BUTTON_HOLD_TIME = 1000;
 const int MENU_WINDING_STATUS = 0;
 const int MENU_SET_SPEED = 1;
 const int MENU_SET_TURNS = 2;
+const int MENU_SET_SERVO_LEFT = 3;
+const int MENU_SET_SERVO_RIGHT = 4;
+
+// Параметры сервопривода SG-90
+const int SERVO_CENTER_ANGLE = 90;
+const int SERVO_MIN_ANGLE = 0;
+const int SERVO_MAX_ANGLE = 180;
+const int SERVO_DEFAULT_LEFT_ANGLE = 60;
+const int SERVO_DEFAULT_RIGHT_ANGLE = 120;
+const int SERVO_DEGREES_PER_REV = 1;
+const int SERVO_MIN_SPAN = 2;
+const unsigned int SERVO_MIN_PULSE_US = 544;
+const unsigned int SERVO_MAX_PULSE_US = 2400;
+const unsigned int SERVO_TIMER_TICK_US = 128;
+const uint8_t SERVO_FRAME_TICKS = 156;
+const unsigned long SERVO_POSITION_STEP_INTERVAL_MS = 20;
 
 // пункт меню
 int menu = MENU_SET_SPEED;
@@ -73,6 +90,15 @@ volatile boolean winding = false;
 boolean lcdNeedsUpdate = true;
 // целевая позиция в шагах
 volatile long targetPosition = 0;
+// текущий угол сервопривода
+volatile uint8_t servoCurrentAngle = SERVO_CENTER_ANGLE;
+// целевой угол сервопривода
+volatile uint8_t servoTargetAngle = SERVO_CENTER_ANGLE;
+// направление укладки: true - вправо, false - влево
+volatile boolean servoMovingRight = true;
+// пределы укладки
+volatile uint8_t servoLeftLimit = SERVO_DEFAULT_LEFT_ANGLE;
+volatile uint8_t servoRightLimit = SERVO_DEFAULT_RIGHT_ANGLE;
 
 // переменная для безопасного чтения из прерывания
 volatile long safeCurrentNumberOfTurns = 0;
@@ -127,6 +153,11 @@ long lastDisplayedTurns = -1;
 
 // Флаг для отслеживания состояния драйвера
 boolean driverEnabled = false;
+
+// Переменные генерации сигнала сервопривода
+volatile uint8_t servoPulseTicks = 12;
+volatile uint8_t servoFrameTick = 0;
+unsigned long lastServoPositionUpdateMs = 0;
 
 // ========== НОВЫЕ: функции для очень плавного разгона ==========
 
@@ -297,6 +328,107 @@ boolean isValidSpeed(long rpm) {
   return (rpm >= MIN_RPM && rpm <= MAX_RPM);
 }
 
+int clampServoAngle(int angle) {
+  if (angle < SERVO_MIN_ANGLE) {
+    return SERVO_MIN_ANGLE;
+  }
+  if (angle > SERVO_MAX_ANGLE) {
+    return SERVO_MAX_ANGLE;
+  }
+  return angle;
+}
+
+unsigned int servoAngleToPulseUs(int angle) {
+  int clampedAngle = clampServoAngle(angle);
+  long pulse = map(clampedAngle, SERVO_MIN_ANGLE, SERVO_MAX_ANGLE, SERVO_MIN_PULSE_US, SERVO_MAX_PULSE_US);
+  return (unsigned int)pulse;
+}
+
+uint8_t servoPulseUsToTicks(unsigned int pulseUs) {
+  unsigned int roundedTicks = (pulseUs + (SERVO_TIMER_TICK_US / 2)) / SERVO_TIMER_TICK_US;
+
+  if (roundedTicks < 1) {
+    roundedTicks = 1;
+  }
+
+  if (roundedTicks >= SERVO_FRAME_TICKS) {
+    roundedTicks = SERVO_FRAME_TICKS - 1;
+  }
+
+  return (uint8_t)roundedTicks;
+}
+
+void updateServoPulseTicks() {
+  uint8_t currentAngle;
+
+  noInterrupts();
+  currentAngle = servoCurrentAngle;
+  interrupts();
+
+  uint8_t nextPulseTicks = servoPulseUsToTicks(servoAngleToPulseUs(currentAngle));
+
+  noInterrupts();
+  servoPulseTicks = nextPulseTicks;
+  interrupts();
+}
+
+void resetServoLayPosition() {
+  noInterrupts();
+  servoCurrentAngle = servoLeftLimit;
+  servoTargetAngle = servoLeftLimit;
+  servoMovingRight = true;
+  interrupts();
+
+  updateServoPulseTicks();
+}
+
+void updateServoLayTargetFromISR() {
+  int nextAngle = servoTargetAngle;
+
+  if (servoMovingRight) {
+    nextAngle += SERVO_DEGREES_PER_REV;
+    if (nextAngle >= servoRightLimit) {
+      nextAngle = servoRightLimit;
+      servoMovingRight = false;
+    }
+  } else {
+    nextAngle -= SERVO_DEGREES_PER_REV;
+    if (nextAngle <= servoLeftLimit) {
+      nextAngle = servoLeftLimit;
+      servoMovingRight = true;
+    }
+  }
+
+  servoTargetAngle = nextAngle;
+}
+
+void updateServoPosition(unsigned long currentMillis) {
+  if (currentMillis - lastServoPositionUpdateMs < SERVO_POSITION_STEP_INTERVAL_MS) {
+    return;
+  }
+
+  lastServoPositionUpdateMs = currentMillis;
+
+  int targetAngle;
+  boolean changed = false;
+
+  noInterrupts();
+  targetAngle = servoTargetAngle;
+  interrupts();
+
+  if (servoCurrentAngle < targetAngle) {
+    servoCurrentAngle++;
+    changed = true;
+  } else if (servoCurrentAngle > targetAngle) {
+    servoCurrentAngle--;
+    changed = true;
+  }
+
+  if (changed) {
+    updateServoPulseTicks();
+  }
+}
+
 void setup() {
   Serial.begin(9600);
   
@@ -304,9 +436,11 @@ void setup() {
   pinMode(ENABLE_PIN, OUTPUT);
   pinMode(STEP_PIN, OUTPUT);
   pinMode(DIR_PIN, OUTPUT);
+  pinMode(SERVO_PIN, OUTPUT);
   
   digitalWrite(ENABLE_PIN, HIGH);
   digitalWrite(STEP_PIN, LOW);
+  digitalWrite(SERVO_PIN, LOW);
   
   lcd.init();
   lcd.backlight();
@@ -331,6 +465,12 @@ void setup() {
   TCCR1B |= (1 << WGM12);
   TCCR1B |= (1 << CS11);
   TIMSK1 |= (1 << OCIE1A);
+
+  TCCR2A = 0;
+  TCCR2B = 0;
+  TCNT2 = 0;
+  TCCR2B |= (1 << CS21);
+  TIMSK2 |= (1 << TOIE2);
   
   EICRA |= (1 << ISC00);
   EIMSK |= (1 << INT0);
@@ -349,6 +489,8 @@ void setup() {
   motion.accelerating = false;
   motion.decelerating = false;
   motion.creeping = false;
+
+  resetServoLayPosition();
   
   Serial.println("=== Motor Configuration ===");
   Serial.print("MAX RPM: ");
@@ -382,6 +524,7 @@ ISR(TIMER1_COMPA_vect) {
       if (motion.currentPosition % STEPS_PER_REV == 0) {
         currentNumberOfTurns = motion.currentPosition / STEPS_PER_REV;
         turnsUpdated = true;
+        updateServoLayTargetFromISR();
       }
       
       // Обновляем разгон/торможение КАЖДЫЙ шаг для максимальной плавности
@@ -390,6 +533,22 @@ ISR(TIMER1_COMPA_vect) {
     } else {
       stopWindingFromISR();
     }
+  }
+}
+
+ISR(TIMER2_OVF_vect) {
+  if (servoFrameTick == 0) {
+    digitalWrite(SERVO_PIN, HIGH);
+  }
+
+  servoFrameTick++;
+
+  if (servoFrameTick == servoPulseTicks) {
+    digitalWrite(SERVO_PIN, LOW);
+  }
+
+  if (servoFrameTick >= SERVO_FRAME_TICKS) {
+    servoFrameTick = 0;
   }
 }
 
@@ -411,6 +570,8 @@ void stopWindingFromISR() {
 
 void loop() {
   unsigned long currentMillis = millis();
+
+  updateServoPosition(currentMillis);
   
   if (turnsUpdated) {
     noInterrupts();
@@ -460,7 +621,6 @@ void loop() {
     }
   }
   
-  delay(1);
 }
 
 void stopWinding() {
@@ -540,6 +700,8 @@ void startWinding() {
   delay(10);
   directEnableDriver();
   delay(10);
+
+  resetServoLayPosition();
   
   noInterrupts();
   motion.currentPosition = 0;
@@ -560,6 +722,8 @@ void startWinding() {
   
   OCR1A = motion.creepStepInterval;  // Стартуем экстремально медленно
   TCNT1 = 0;
+  servoFrameTick = 0;
+  lastServoPositionUpdateMs = millis();
   winding = true;
   interrupts();
   
@@ -615,7 +779,7 @@ void checkAndHandleVRX(unsigned long currentMillis) {
   
   if (x > 700) {
     int newMenu = menu + 1;
-    if (newMenu > MENU_SET_TURNS) {
+    if (newMenu > MENU_SET_SERVO_RIGHT) {
       newMenu = MENU_SET_SPEED;
     }
     if (newMenu != menu) {
@@ -626,7 +790,7 @@ void checkAndHandleVRX(unsigned long currentMillis) {
   } else if (x < 300) {
     int newMenu = menu - 1;
     if (newMenu < MENU_SET_SPEED) {
-      newMenu = MENU_SET_TURNS;
+      newMenu = MENU_SET_SERVO_RIGHT;
     }
     if (newMenu != menu) {
       menu = newMenu;
@@ -664,6 +828,20 @@ void checkAndHandleVRY(unsigned long currentMillis) {
           valueChanged = true;
         }
         break;
+      case MENU_SET_SERVO_LEFT:
+        if (servoLeftLimit + 1 <= servoRightLimit - SERVO_MIN_SPAN) {
+          servoLeftLimit++;
+          valueChanged = true;
+          resetServoLayPosition();
+        }
+        break;
+      case MENU_SET_SERVO_RIGHT:
+        if (servoRightLimit + 1 <= SERVO_MAX_ANGLE) {
+          servoRightLimit++;
+          valueChanged = true;
+          resetServoLayPosition();
+        }
+        break;
     }
     if (valueChanged) {
       lastVryTriggerTime = currentMillis;
@@ -684,6 +862,20 @@ void checkAndHandleVRY(unsigned long currentMillis) {
         if (targetNumberOfTurns - 100 >= MIN_TURNS) {
           targetNumberOfTurns = targetNumberOfTurns - 100;
           valueChanged = true;
+        }
+        break;
+      case MENU_SET_SERVO_LEFT:
+        if (servoLeftLimit - 1 >= SERVO_MIN_ANGLE) {
+          servoLeftLimit--;
+          valueChanged = true;
+          resetServoLayPosition();
+        }
+        break;
+      case MENU_SET_SERVO_RIGHT:
+        if (servoRightLimit - 1 >= servoLeftLimit + SERVO_MIN_SPAN) {
+          servoRightLimit--;
+          valueChanged = true;
+          resetServoLayPosition();
         }
         break;
     }
@@ -722,6 +914,8 @@ void updateDisplay() {
       lcd.print(String(safeCurrentNumberOfTurns));
       lcd.print("/");
       lcd.print(String(targetNumberOfTurns));
+      lcd.print(" A");
+      lcd.print(String(servoCurrentAngle));
       break;
       
     case MENU_SET_SPEED:
@@ -739,6 +933,30 @@ void updateDisplay() {
 
       lcd.setCursor(0, 1);
       lcd.print(String(targetNumberOfTurns));
+      break;
+
+    case MENU_SET_SERVO_LEFT:
+      lcd.setCursor(0, 0);
+      lcd.print("SERVO LEFT:");
+
+      lcd.setCursor(0, 1);
+      lcd.print(String(servoLeftLimit));
+      lcd.print((char)223);
+      lcd.print(" MAX ");
+      lcd.print(String(servoRightLimit));
+      lcd.print((char)223);
+      break;
+
+    case MENU_SET_SERVO_RIGHT:
+      lcd.setCursor(0, 0);
+      lcd.print("SERVO RIGHT:");
+
+      lcd.setCursor(0, 1);
+      lcd.print(String(servoRightLimit));
+      lcd.print((char)223);
+      lcd.print(" MIN ");
+      lcd.print(String(servoLeftLimit));
+      lcd.print((char)223);
       break;
   }
 }
