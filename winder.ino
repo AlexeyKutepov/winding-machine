@@ -12,9 +12,6 @@ const int ENABLE_PIN = 3;
 const int STEP_PIN = 5;
 const int SERVO_PIN = 4;
 
-// Используем пины с аппаратными прерываниями для кнопки
-#define PIN_BUTTON_INTERRUPT 2
-
 // ограничение по максимальному числу оборотов в минуту
 const long MAX_RPM = 340;
 // ограничение по минимальному числу оборотов в минуту
@@ -70,6 +67,9 @@ const int SERVO_DEFAULT_LEFT_ANGLE = 60;
 const int SERVO_DEFAULT_RIGHT_ANGLE = 120;
 const int SERVO_DEGREES_PER_REV = 1;
 const int SERVO_MIN_SPAN = 2;
+const int SERVO_SUBDEGREES_PER_DEGREE = 10;
+const int SERVO_TARGET_SUBDEGREES_PER_REV = SERVO_DEGREES_PER_REV * SERVO_SUBDEGREES_PER_DEGREE;
+const int SERVO_MAX_SUBDEGREES_PER_UPDATE = 2;
 const unsigned long SERVO_REFRESH_INTERVAL_US = 20000;
 const unsigned int SERVO_MIN_PULSE_US = 544;
 const unsigned int SERVO_MAX_PULSE_US = 2400;
@@ -88,12 +88,10 @@ volatile boolean winding = false;
 boolean lcdNeedsUpdate = true;
 // целевая позиция в шагах
 volatile long targetPosition = 0;
-// текущий угол сервопривода
-volatile uint8_t servoCurrentAngle = SERVO_CENTER_ANGLE;
-// целевой угол сервопривода
-volatile uint8_t servoTargetAngle = SERVO_CENTER_ANGLE;
-// направление укладки: true - вправо, false - влево
-volatile boolean servoMovingRight = true;
+// текущее положение сервопривода в десятых долях градуса
+volatile int servoCurrentAngleSubdegrees = SERVO_CENTER_ANGLE * SERVO_SUBDEGREES_PER_DEGREE;
+// целевое положение сервопривода в десятых долях градуса
+volatile int servoTargetAngleSubdegrees = SERVO_CENTER_ANGLE * SERVO_SUBDEGREES_PER_DEGREE;
 // пределы укладки
 volatile uint8_t servoLeftLimit = SERVO_DEFAULT_LEFT_ANGLE;
 volatile uint8_t servoRightLimit = SERVO_DEFAULT_RIGHT_ANGLE;
@@ -115,6 +113,16 @@ boolean buttonHeld = false;
 AccelStepper stepper(motorInterfaceType, STEP_PIN, DIR_PIN);
 
 LiquidCrystal_I2C lcd(0x27,16,2);
+
+void stopWindingFromISR();
+void updateDisplay();
+void checkAndHandleStartStopButton(unsigned long currentMillis);
+void checkAndHandleVRX(unsigned long currentMillis);
+void checkAndHandleVRY(unsigned long currentMillis);
+void emergencyStop();
+void toggleWinding();
+void startWinding();
+void pauseWinding();
 
 // Переменные для управления джойстиком
 unsigned long lastJoystickCheck = 0;
@@ -336,51 +344,92 @@ int clampServoAngle(int angle) {
   return angle;
 }
 
-unsigned int servoAngleToPulseUs(int angle) {
-  int clampedAngle = clampServoAngle(angle);
-  long pulse = map(clampedAngle, SERVO_MIN_ANGLE, SERVO_MAX_ANGLE, SERVO_MIN_PULSE_US, SERVO_MAX_PULSE_US);
+int clampServoSubdegrees(int angleSubdegrees) {
+  int minSubdegrees = SERVO_MIN_ANGLE * SERVO_SUBDEGREES_PER_DEGREE;
+  int maxSubdegrees = SERVO_MAX_ANGLE * SERVO_SUBDEGREES_PER_DEGREE;
+
+  if (angleSubdegrees < minSubdegrees) {
+    return minSubdegrees;
+  }
+  if (angleSubdegrees > maxSubdegrees) {
+    return maxSubdegrees;
+  }
+  return angleSubdegrees;
+}
+
+unsigned int servoAngleToPulseUs(int angleSubdegrees) {
+  int clampedAngle = clampServoSubdegrees(angleSubdegrees);
+  long pulseRange = (long)SERVO_MAX_PULSE_US - SERVO_MIN_PULSE_US;
+  long pulse = SERVO_MIN_PULSE_US + (pulseRange * clampedAngle) / (SERVO_MAX_ANGLE * SERVO_SUBDEGREES_PER_DEGREE);
   return (unsigned int)pulse;
 }
 
 void resetServoLayPosition() {
   noInterrupts();
-  servoCurrentAngle = servoLeftLimit;
-  servoTargetAngle = servoLeftLimit;
-  servoMovingRight = true;
+  servoCurrentAngleSubdegrees = servoLeftLimit * SERVO_SUBDEGREES_PER_DEGREE;
+  servoTargetAngleSubdegrees = servoLeftLimit * SERVO_SUBDEGREES_PER_DEGREE;
   interrupts();
 }
 
-void updateServoLayTargetFromISR() {
-  int nextAngle = servoTargetAngle;
+void updateServoLayTarget() {
+  long currentPositionSnapshot;
+  int leftLimitSnapshot;
+  int rightLimitSnapshot;
 
-  if (servoMovingRight) {
-    nextAngle += SERVO_DEGREES_PER_REV;
-    if (nextAngle >= servoRightLimit) {
-      nextAngle = servoRightLimit;
-      servoMovingRight = false;
-    }
-  } else {
-    nextAngle -= SERVO_DEGREES_PER_REV;
-    if (nextAngle <= servoLeftLimit) {
-      nextAngle = servoLeftLimit;
-      servoMovingRight = true;
-    }
+  noInterrupts();
+  currentPositionSnapshot = motion.currentPosition;
+  leftLimitSnapshot = servoLeftLimit;
+  rightLimitSnapshot = servoRightLimit;
+  interrupts();
+
+  int spanSubdegrees = (rightLimitSnapshot - leftLimitSnapshot) * SERVO_SUBDEGREES_PER_DEGREE;
+  if (spanSubdegrees <= 0) {
+    noInterrupts();
+    servoTargetAngleSubdegrees = leftLimitSnapshot * SERVO_SUBDEGREES_PER_DEGREE;
+    interrupts();
+    return;
   }
 
-  servoTargetAngle = nextAngle;
+  unsigned long travelSubdegrees = ((unsigned long)currentPositionSnapshot * SERVO_TARGET_SUBDEGREES_PER_REV) / STEPS_PER_REV;
+  unsigned long cycleSubdegrees = (unsigned long)spanSubdegrees * 2UL;
+  unsigned long cyclePosition = cycleSubdegrees == 0 ? 0 : travelSubdegrees % cycleSubdegrees;
+
+  int targetSubdegrees = leftLimitSnapshot * SERVO_SUBDEGREES_PER_DEGREE;
+  if (cyclePosition <= (unsigned long)spanSubdegrees) {
+    targetSubdegrees += (int)cyclePosition;
+  } else {
+    targetSubdegrees += spanSubdegrees - (int)(cyclePosition - spanSubdegrees);
+  }
+
+  noInterrupts();
+  servoTargetAngleSubdegrees = targetSubdegrees;
+  interrupts();
 }
 
 void updateServoPosition() {
-  int targetAngle;
+  static unsigned long lastServoMoveAtMs = 0;
+  unsigned long nowMs = millis();
+  int targetAngleSubdegrees;
 
   noInterrupts();
-  targetAngle = servoTargetAngle;
+  targetAngleSubdegrees = servoTargetAngleSubdegrees;
   interrupts();
 
-  if (servoCurrentAngle < targetAngle) {
-    servoCurrentAngle++;
-  } else if (servoCurrentAngle > targetAngle) {
-    servoCurrentAngle--;
+  if (nowMs == lastServoMoveAtMs) {
+    return;
+  }
+  lastServoMoveAtMs = nowMs;
+
+  if (servoCurrentAngleSubdegrees < targetAngleSubdegrees) {
+    servoCurrentAngleSubdegrees += SERVO_MAX_SUBDEGREES_PER_UPDATE;
+    if (servoCurrentAngleSubdegrees > targetAngleSubdegrees) {
+      servoCurrentAngleSubdegrees = targetAngleSubdegrees;
+    }
+  } else if (servoCurrentAngleSubdegrees > targetAngleSubdegrees) {
+    servoCurrentAngleSubdegrees -= SERVO_MAX_SUBDEGREES_PER_UPDATE;
+    if (servoCurrentAngleSubdegrees < targetAngleSubdegrees) {
+      servoCurrentAngleSubdegrees = targetAngleSubdegrees;
+    }
   }
 }
 
@@ -388,7 +437,7 @@ void updateServoSignal() {
   unsigned long nowUs = micros();
 
   if (servoPulseActive) {
-    unsigned int pulseWidth = servoAngleToPulseUs(servoCurrentAngle);
+    unsigned int pulseWidth = servoAngleToPulseUs(servoCurrentAngleSubdegrees);
     if (nowUs - servoPulseStartUs >= pulseWidth) {
       digitalWrite(SERVO_PIN, LOW);
       servoPulseActive = false;
@@ -440,9 +489,6 @@ void setup() {
   TCCR1B |= (1 << CS11);
   TIMSK1 |= (1 << OCIE1A);
   
-  EICRA |= (1 << ISC00);
-  EIMSK |= (1 << INT0);
-  
   interrupts();
   
   // Инициализация структуры движения
@@ -492,7 +538,6 @@ ISR(TIMER1_COMPA_vect) {
       if (motion.currentPosition % STEPS_PER_REV == 0) {
         currentNumberOfTurns = motion.currentPosition / STEPS_PER_REV;
         turnsUpdated = true;
-        updateServoLayTargetFromISR();
       }
       
       // Обновляем разгон/торможение КАЖДЫЙ шаг для максимальной плавности
@@ -501,16 +546,6 @@ ISR(TIMER1_COMPA_vect) {
     } else {
       stopWindingFromISR();
     }
-  }
-}
-
-// Прерывание для кнопки
-ISR(INT0_vect) {
-  static unsigned long lastInterruptTime = 0;
-  unsigned long currentTime = millis();
-  
-  if (currentTime - lastInterruptTime > DEBOUNCE_DELAY) {
-    lastInterruptTime = currentTime;
   }
 }
 
@@ -523,6 +558,7 @@ void stopWindingFromISR() {
 void loop() {
   unsigned long currentMillis = millis();
 
+  updateServoLayTarget();
   updateServoPosition();
   updateServoSignal();
   
@@ -679,6 +715,8 @@ void startWinding() {
   servoLastRefreshUs = micros();
   winding = true;
   interrupts();
+
+  updateServoLayTarget();
   
   menu = MENU_WINDING_STATUS;
   lcdNeedsUpdate = true;
@@ -843,6 +881,12 @@ void checkAndHandleVRY(unsigned long currentMillis) {
 }
 
 void updateDisplay() {
+  int servoAngleSubdegreesSnapshot;
+
+  noInterrupts();
+  servoAngleSubdegreesSnapshot = servoCurrentAngleSubdegrees;
+  interrupts();
+
   lcd.clear();
   
   switch (menu) {
@@ -868,7 +912,9 @@ void updateDisplay() {
       lcd.print("/");
       lcd.print(String(targetNumberOfTurns));
       lcd.print(" A");
-      lcd.print(String(servoCurrentAngle));
+      lcd.print(String(servoAngleSubdegreesSnapshot / SERVO_SUBDEGREES_PER_DEGREE));
+      lcd.print(".");
+      lcd.print(String(abs(servoAngleSubdegreesSnapshot % SERVO_SUBDEGREES_PER_DEGREE)));
       break;
       
     case MENU_SET_SPEED:
